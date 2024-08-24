@@ -8,7 +8,7 @@ use crate::framework::itest;
 async fn call_async_fn(signal: Signal) -> u8 {
     let value = 5;
 
-    let _: () = signal.to_future().await;
+    let _: () = signal.to_local_future().await;
 
     value + 5
 }

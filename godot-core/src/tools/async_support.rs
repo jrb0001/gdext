@@ -1,119 +1,110 @@
-use std::cell::RefCell;
 use std::future::Future;
+use std::mem::ManuallyDrop;
+use std::ops::DerefMut;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Wake, Waker};
+use std::thread::ThreadId;
 
-use crate::builtin::{Callable, Signal, Variant};
+use crate::builtin::{Callable, GString, Signal, Variant};
 use crate::classes::object::ConnectFlags;
-use crate::godot_error;
+use crate::global::godot_error;
 use crate::meta::FromGodot;
 use crate::obj::EngineEnum;
+use impl_trait_for_tuples::impl_for_tuples;
 
-pub fn godot_task(future: impl Future<Output = ()> + 'static) {
-    let waker: Waker = ASYNC_RUNTIME.with_borrow_mut(move |rt| {
-        let task_index = rt.add_task(Box::pin(future));
-        Arc::new(GodotWaker::new(task_index)).into()
-    });
+pub fn godot_task_local(future: impl Future<Output = ()> + 'static) {
+    godot_task_sync(LocalFuture::new(future))
+}
 
+pub fn godot_task_sync(future: impl Future<Output = ()> + 'static + Send + Sync) {
+    let waker = Arc::new(GodotWaker::new_sync(future));
     waker.wake();
 }
 
-thread_local! { static ASYNC_RUNTIME: RefCell<AsyncRuntime> = RefCell::new(AsyncRuntime::new()); }
-
-struct AsyncRuntime {
-    tasks: Vec<Option<Pin<Box<dyn Future<Output = ()>>>>>,
-}
-
-impl AsyncRuntime {
-    fn new() -> Self {
-        Self {
-            tasks: Vec::with_capacity(10),
-        }
-    }
-
-    fn add_task<F: Future<Output = ()> + 'static>(&mut self, future: F) -> usize {
-        let slot = self
-            .tasks
-            .iter_mut()
-            .enumerate()
-            .find(|(_, slot)| slot.is_none());
-
-        let boxed = Box::pin(future);
-
-        match slot {
-            Some((index, slot)) => {
-                *slot = Some(boxed);
-                index
-            }
-            None => {
-                self.tasks.push(Some(boxed));
-                self.tasks.len() - 1
-            }
-        }
-    }
-
-    fn get_task(&mut self, index: usize) -> Option<Pin<&mut (dyn Future<Output = ()> + 'static)>> {
-        let slot = self.tasks.get_mut(index);
-
-        slot.and_then(|inner| inner.as_mut())
-            .map(|fut| fut.as_mut())
-    }
-
-    fn clear_task(&mut self, index: usize) {
-        if index >= self.tasks.len() {
-            return;
-        }
-
-        self.tasks[0] = None;
-    }
-}
-
 struct GodotWaker {
-    runtime_index: usize,
+    future: Mutex<Pin<Box<dyn Future<Output = ()> + 'static + Send + Sync>>>,
+    again: AtomicBool,
 }
 
 impl GodotWaker {
-    fn new(index: usize) -> Self {
+    fn new_sync(future: impl Future<Output = ()> + 'static + Send + Sync) -> Self {
         Self {
-            runtime_index: index,
+            future: Mutex::new(Box::pin(future)),
+            again: AtomicBool::new(false),
         }
     }
 }
 
 impl Wake for GodotWaker {
-    fn wake(self: std::sync::Arc<Self>) {
+    fn wake(self: Arc<Self>) {
         let waker: Waker = self.clone().into();
         let mut ctx = Context::from_waker(&waker);
 
-        ASYNC_RUNTIME.with_borrow_mut(|rt| {
-            let Some(future) = rt.get_task(self.runtime_index) else {
-                godot_error!("Future no longer exists! This is a bug!");
-                return;
-            };
-
-            // this does currently not support nested tasks.
-            let result = future.poll(&mut ctx);
-            match result {
-                Poll::Pending => (),
-                Poll::Ready(()) => rt.clear_task(self.runtime_index),
+        // Flag must be set before locking to avoid race condition.
+        self.again.store(true, Ordering::SeqCst);
+        if let Ok(mut future) = self.future.try_lock() {
+            while self.again.swap(false, Ordering::SeqCst) {
+                let _ = future.as_mut().poll(&mut ctx);
             }
-        });
+        }
     }
 }
+
+struct LocalFuture<F: Future + 'static> {
+    future: ManuallyDrop<F>,
+    thread: ThreadId,
+}
+
+impl<F: Future + 'static> LocalFuture<F> {
+    fn new(future: F) -> Self {
+        Self {
+            future: ManuallyDrop::new(future),
+            thread: std::thread::current().id(),
+        }
+    }
+}
+
+impl<F: Future + 'static> Future for LocalFuture<F> {
+    type Output = F::Output;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        assert_eq!(self.thread, std::thread::current().id());
+        unsafe { self.map_unchecked_mut(|s| s.future.deref_mut()) }.poll(cx)
+    }
+}
+
+impl<F: Future + 'static> Drop for LocalFuture<F> {
+    fn drop(&mut self) {
+        if self.thread == std::thread::current().id() {
+            unsafe { ManuallyDrop::drop(&mut self.future) };
+        } else if std::thread::panicking() {
+            godot_error!(
+                "LocalFuture is dropped on another thread while panicking. Leaking inner Future to avoid abort."
+            );
+        } else {
+            panic!("LocalFuture is dropped on another thread.");
+        }
+    }
+}
+
+// Verified at runtime by checking the current thread id.
+unsafe impl<F: Future + 'static> Send for LocalFuture<F> {}
+unsafe impl<F: Future + 'static> Sync for LocalFuture<F> {}
 
 pub struct SignalFuture<R: FromSignalArgs> {
     state: Arc<Mutex<(Option<R>, Option<Waker>)>>,
 }
 
 impl<R: FromSignalArgs> SignalFuture<R> {
-    fn new(signal: Signal) -> Self {
+    fn new(name: impl Into<GString>, signal: Signal) -> Self {
         let state = Arc::new(Mutex::new((None, Option::<Waker>::None)));
         let callback_state = state.clone();
 
         // the callable currently requires that the return value is Sync + Send
         signal.connect(
-            Callable::from_fn("async_task", move |args: &[&Variant]| {
+            Callable::from_fn(name, move |args: &[&Variant]| {
                 let mut lock = callback_state.lock().unwrap();
                 let waker = lock.1.take();
 
@@ -153,21 +144,13 @@ pub trait FromSignalArgs: Sync + Send + 'static {
     fn from_args(args: &[&Variant]) -> Self;
 }
 
-impl<R: FromGodot + Sync + Send + 'static> FromSignalArgs for R {
+#[impl_for_tuples(12)]
+impl FromSignalArgs for Tuple {
+    for_tuples!( where #(Tuple: FromGodot + Sync + Send + 'static),* );
     fn from_args(args: &[&Variant]) -> Self {
-        args.first()
-            .map(|arg| (*arg).to_owned())
-            .unwrap_or_default()
-            .to()
-    }
-}
-
-// more of these should be generated via macro to support more than two signal arguments
-impl<R1: FromGodot + Sync + Send + 'static, R2: FromGodot + Sync + Send + 'static> FromSignalArgs
-    for (R1, R2)
-{
-    fn from_args(args: &[&Variant]) -> Self {
-        (args[0].to(), args[0].to())
+        let mut iter = args.iter();
+        #[allow(clippy::unused_unit)]
+        (for_tuples!(#(iter.next().unwrap().to()),*))
     }
 }
 
@@ -179,6 +162,6 @@ pub trait ToSignalFuture<R: FromSignalArgs> {
 
 impl<R: FromSignalArgs> ToSignalFuture<R> for Signal {
     fn to_future(&self) -> SignalFuture<R> {
-        SignalFuture::new(self.clone())
+        SignalFuture::new(format!("Signal::{}", self), self.clone())
     }
 }
